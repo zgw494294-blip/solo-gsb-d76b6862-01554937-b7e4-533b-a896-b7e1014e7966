@@ -28,6 +28,14 @@ completed 片段（center=命中末条序号、before=模式长度减 1、after=
 （直接复制自动机标量状态）。分叉在来源会话锁内完成取号与快照，等效于与
 来源已有操作串行执行的某个时刻；来源保持不变，两支此后的写入、触发、
 删除、调参与模式操作互不影响。不提供合并与落盘。
+
+成组提交连续样本：会话可经 HTTP 一次提交 1～100 个整数值（布尔值、字符串、
+浮点数均拒绝），整批接收或整批拒绝，不留下部分写入。批内按输入顺序逐条
+应用现有写入、匹配、留样与回收规则，每一步均按当时状态检查容量，而非只
+核算批末；任一步超容则整批 409 并返回首个失败项从 1 起的 index，样本、
+片段、样本与片段编号、匹配进度与命中记录均恢复批前状态，本批回收的旧
+样本也一并还原。整批在会话锁内一次完成，等效于与会话内其他操作的一次
+串行执行：其他操作不能插入批内，查询与分叉只能看到批前或批后状态。
 """
 from __future__ import annotations
 
@@ -35,6 +43,7 @@ import asyncio
 from collections import deque
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 app = FastAPI(title="sample-fragment-service", version="1.0.0")
@@ -77,6 +86,23 @@ class UpdateLimitsRequest(BaseModel):
 
 class WriteSampleRequest(BaseModel):
     value: int = Field(description="整数样本值")
+
+
+class WriteBatchRequest(BaseModel):
+    values: list[int] = Field(description="一批整数样本值，1～100 个；元素必须为整数")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _check_values(cls, data: object) -> object:
+        # 显式校验，确保布尔值、字符串、浮点等不会被宽松转换为整数（返回 422）
+        if not isinstance(data, dict) or not isinstance(data.get("values"), list):
+            raise ValueError("values 必须是整数数组，长度 1～100")
+        values = data["values"]
+        if not (1 <= len(values) <= 100):
+            raise ValueError("values 长度必须在 1～100 之间")
+        if any(type(x) is not int for x in values):
+            raise ValueError("values 元素必须是整数，不能为布尔值、字符串或浮点数")
+        return data
 
 
 class TriggerRequest(BaseModel):
@@ -163,6 +189,15 @@ class Fragment:
 
 def _conflict(detail: str) -> HTTPException:
     return HTTPException(status_code=409, detail=detail)
+
+
+class BatchConflictError(Exception):
+    """批量写入中途超容：携带首个失败项从 1 起的序号；抛出前状态已整体回滚。"""
+
+    def __init__(self, index: int, detail: str):
+        super().__init__(detail)
+        self.index = index
+        self.detail = detail
 
 
 class Session:
@@ -335,6 +370,41 @@ class Session:
         self.samples = kept
         self.next_seq = n + 1
 
+    # ---- 批量写入 ----
+
+    def write_batch(self, values: list[int]) -> list[int]:
+        """成组写入一批样本：全部成功才提交，任一步超容则整体回滚。
+
+        按输入顺序逐条调用 write，故写入、匹配、留样与回收规则及每步的
+        容量检查与逐条写入完全一致（非只核算批末）。任一条抛 409 时恢复
+        批前状态——样本（含本批回收的旧样本）、片段、样本与片段编号、
+        匹配进度与命中记录——再抛 BatchConflictError（携带首个失败项
+        从 1 起的序号）。调用方在会话锁内执行本方法，故整批等效于与会话
+        内其他操作的一次串行执行，查询与分叉只能看到批前或批后状态。
+        """
+        saved_next_seq = self.next_seq
+        saved_samples = dict(self.samples)
+        saved_fragments = dict(self.fragments)  # 命中留样会就地增删，须复制
+        saved_next_fragment_id = self.next_fragment_id
+        saved_matcher_state = self.matcher.state if self.matcher is not None else None
+        saved_hit_count = self.hit_count
+        saved_recent_hits = deque(self.recent_hits, maxlen=100)
+        seqs: list[int] = []
+        try:
+            for value in values:
+                seqs.append(self.write(value))
+        except HTTPException as exc:
+            self.next_seq = saved_next_seq
+            self.samples = saved_samples
+            self.fragments = saved_fragments
+            self.next_fragment_id = saved_next_fragment_id
+            if self.matcher is not None:
+                self.matcher.state = saved_matcher_state
+            self.hit_count = saved_hit_count
+            self.recent_hits = saved_recent_hits
+            raise BatchConflictError(len(seqs) + 1, str(exc.detail)) from exc
+        return seqs
+
     def trigger(self, before: int, after: int) -> Fragment:
         """以当前末条为中心创建片段；历史不足时抛 409。"""
         if before >= self.history:
@@ -501,6 +571,36 @@ async def write_sample(session_id: int, req: WriteSampleRequest) -> dict:
     async with sess.lock:
         seq = sess.write(req.value)
         return {"seq": seq, "value": req.value}
+
+
+@app.post("/sessions/{session_id}/samples/batch", status_code=201)
+async def write_samples_batch(session_id: int, req: WriteBatchRequest) -> dict:
+    """成组写入一批连续样本：整批接收或整批拒绝，不留下部分写入。
+
+    按输入顺序逐条应用与单条写入完全相同的容量、匹配、留样与回收规则，
+    每一步都按当时状态检查容量。全部成功返回 201 与每项的 seq/value
+    （按输入顺序，批内已被回收的样本也返回）；任一步超容则整批 409，
+    响应体带首个失败项从 1 起的 index，样本、片段、两类编号、匹配进度
+    与命中记录均恢复批前状态。整个批次在会话锁内一次完成，等效于与会话
+    内其他操作的一次串行执行，查询与分叉只能看到批前或批后状态。
+    会话不存在返回 404；values 非 1～100 个整数（布尔值、字符串、浮点数
+    均拒绝）返回 422 且不改变任何状态。
+    """
+    sess = _get_session(session_id)
+    async with sess.lock:
+        try:
+            seqs = sess.write_batch(req.values)
+        except BatchConflictError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": exc.detail, "index": exc.index},
+            )
+        return {
+            "items": [
+                {"seq": seq, "value": value}
+                for seq, value in zip(seqs, req.values)
+            ]
+        }
 
 
 @app.put("/sessions/{session_id}/pattern")

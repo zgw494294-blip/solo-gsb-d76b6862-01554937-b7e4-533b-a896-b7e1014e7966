@@ -42,6 +42,14 @@
   的新 `session_id`（共用同一个递增 ID 计数器），来源不存在返回 `404`，成功返回含新 `session_id`
   的**原会话查询结果**。分叉后两边的写入、触发、删除、参数调整和模式操作**互不影响**，各自继续
   遵守原容量与校验规则；待完成片段在各分支分别等待各自的后续样本。不提供合并，也不落盘。
+- **批量写入（成组提交）**：`POST /sessions/{sid}/samples/batch` 一次提交 `values` 数组
+  （1～100 个整数；布尔值、字符串、浮点数等非整数返回 `422`，未知会话 `404`，非法输入不改变任何状态）。
+  **整批接收或整批拒绝，不留下部分写入**：批内按输入顺序逐条应用与单条写入完全相同的
+  容量、匹配、留样与回收规则，**每一步都按当时状态检查容量**（而非只核算批末）。
+  全部成功返回 `201` 与每项的 `seq`/`value`（按输入顺序排列，**批内已被回收的样本也返回**）；
+  任一步超容则整批 `409`，响应体带首个失败项从 1 起的 `index`，且样本（含本批回收的旧样本）、
+  片段、样本与片段编号、匹配进度与命中记录**均恢复批前状态**。整批在会话锁内一次完成，
+  等效于与会话内其他操作的一次串行执行：其他操作不能插入批内，查询与分叉只能看到批前或批后状态。
 
 ## 启动
 
@@ -71,6 +79,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | POST | `/sessions/{sid}/fork` | 分叉出一条独立续采的新会话，返回含新 `session_id` 的会话状态（来源不存在返回 `404`） |
 | PUT | `/sessions/{sid}/limits` | 不停采样地调整 `history`(H) 与 `capacity`(C)，返回会话状态 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
+| POST | `/sessions/{sid}/samples/batch` | 成组批量写入 1～100 个整数样本：整批接收或整批拒绝，超容返回 `409` 与首个失败项的 `index` |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
 | POST | `/sessions/{sid}/hit-fragments/enable` | 启用命中留样：每次模式命中自动生成 `completed` 留样片段（每会话一次） |
@@ -82,10 +91,12 @@ docker run --rm -p 8000:8000 sample-fragment-service
 错误码：`404` 会话/片段不存在；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
 查询未配置 pattern 的会话、调整参数与存活样本或片段冲突（新历史窗口含已回收样本、
 未删除片段总长或所需序号并集超过新 `C`）、命中留样启用条件不满足（未配置 pattern、已有样本、
-重复启用、模式长度超过 `C`）、启用命中留样后写入或调参超容（含新 `C` 容不下完整模式）；
+重复启用、模式长度超过 `C`）、启用命中留样后写入或调参超容（含新 `C` 容不下完整模式）、
+批量写入任一步超容（响应体带首个失败项从 1 起的 `index`，整批回滚）；
 `400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；`422` 请求体不合法
 （含 pattern 长度非法、元素为布尔值或字符串，
-以及调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`）。
+调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`，
+以及批量 `values` 非 1～100 个整数或含布尔值/字符串/浮点数）。
 
 ## 调用示例
 
@@ -567,6 +578,106 @@ curl -s -X POST http://localhost:8000/sessions/8/fork
 # {"session_id":11,"history":2,"capacity":6,"next_seq":9,"used":5,
 #  "stored_seqs":[4,5,6,7,8],"fragments":[2]}
 ```
+
+### 17. 批量写入：批内命中，批内回收的样本也返回
+
+会话 12 以 `H=2, C=4` 创建并配置 pattern `[1, 1]`，一次批量写入三个 `1`：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# {"session_id":12,"history":2,"capacity":4}
+
+curl -s -X PUT http://localhost:8000/sessions/12/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 1]}'
+# {"pattern":[1,1]}
+
+curl -s -X POST http://localhost:8000/sessions/12/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [1, 1, 1]}'
+# {"items":[{"seq":1,"value":1},{"seq":2,"value":1},{"seq":3,"value":1}]}
+```
+
+批内逐条应用现有匹配规则：两次**重叠命中** `(1,2)`、`(2,3)` 在批内即时记录；
+序号 1 在批内已被历史窗口回收，响应仍按输入顺序返回全部三项的 `seq`/`value`：
+
+```bash
+curl -s http://localhost:8000/sessions/12/pattern/hits
+# {"pattern":[1,1],"hit_count":2,
+#  "recent_hits":[{"start_seq":1,"end_seq":2},{"start_seq":2,"end_seq":3}]}
+
+curl -s http://localhost:8000/sessions/12
+# {"session_id":12,"history":2,"capacity":4,"next_seq":4,"used":2,"stored_seqs":[2,3],"fragments":[]}
+```
+
+`values` 非 1～100 个整数（布尔值、字符串、浮点数均拒绝）返回 `422` 且不改变任何状态；
+未知会话返回 `404`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/12/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [1, true, "x", 1.5]}'
+# 422
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/12/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": []}'
+# 422   —— 长度须为 1～100
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/99/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [1]}'
+# 404
+```
+
+### 18. 批量写入：整批拒绝、回滚与重试
+
+会话 13（`H=2, C=4`）写入 3 条后触发片段 1（引用序号 2–4），再写 1 条使其完成，
+此时并集 `{2,3,4}` 占 3 个位置：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# {"session_id":13,"history":2,"capacity":4}
+
+for v in 10 20 30; do
+  curl -s -X POST http://localhost:8000/sessions/13/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+curl -s -X POST http://localhost:8000/sessions/13/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 1}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/13/samples \
+  -H 'Content-Type: application/json' -d '{"value": 40}' > /dev/null   # seq=4，片段 1 completed
+```
+
+批量写入 `[50, 60, 70]`：**每一步都按当时状态检查容量**——第 1 项（`seq=5`）需要
+`{2,3,4,5}` 恰好占满 `C=4` 可以通过；第 2 项（`seq=6`）需要 `{2,3,4,5,6}` 共 5 个位置
+超容，整批 `409` 并返回首个失败项从 1 起的 `index`：
+
+```bash
+curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [50, 60, 70]}'
+# {"detail":"容量不足：新样本无处容纳，序号未消耗，状态未改变","index":2}
+# 409
+```
+
+第 1 项虽曾暂时写入，也随整批回滚：`next_seq` 仍为 5，样本、片段、两类编号、
+匹配进度与命中记录全部保持批前状态：
+
+```bash
+curl -s http://localhost:8000/sessions/13
+# {"session_id":13,"history":2,"capacity":4,"next_seq":5,"used":3,"stored_seqs":[2,3,4],"fragments":[1]}
+```
+
+删除片段 1 释放容量后**原批重试**，序号从 5 连续编起（拒绝未消耗序号）：
+
+```bash
+curl -s -X DELETE http://localhost:8000/sessions/13/fragments/1 -o /dev/null -w '%{http_code}\n'
+# 204
+
+curl -s -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [50, 60, 70]}'
+# {"items":[{"seq":5,"value":50},{"seq":6,"value":60},{"seq":7,"value":70}]}
+```
+
+启用命中留样的会话同样适用：批内命中即时生成留样片段并参与后续步骤的容量核算；
+若整批失败，批内生成的留样片段、片段编号与命中记录也一并回滚。
 
 ## 本地开发（可选）
 
