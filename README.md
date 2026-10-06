@@ -34,6 +34,14 @@
   超容返回 `409` 且**样本、样本与片段编号、匹配进度、命中记录与片段均不变**；
   删除片段同样保护临时前缀；调参还须保证新 `C` 容得下完整模式及上述并集，否则 `409`
   且不改变任何状态。未启用时原有行为完全不变。
+- **成组写入（批量）**：`POST /sessions/{sid}/samples/batch` 一次提交 `values` 数组
+  （1～100 个整数；布尔值、字符串、浮点数均返回 `422` 且不改变任何状态；未知会话 `404`）。
+  按输入顺序逐条应用现有写入、匹配、留样与回收规则，**每一步都核算容量**（不只核算批末）。
+  成功返回 `201` 与每项的 `seq`/`value`（按输入顺序，批内已被回收的样本也返回）。
+  任一步超容则**整批 `409`**，响应含首个失败项从 1 起的 `index`；样本（含本批回收的
+  旧样本）、片段、样本与片段编号、匹配进度与命中记录全部恢复批前状态。整批在会话锁内
+  一次完成，等效于与会话内其他操作串行执行的一次操作：其他操作不会插入批内，查询与
+  分叉只能看到批前或批后状态。不新增落盘与幂等键。
 - **会话分叉**：`POST /sessions/{sid}/fork` 把当前采样会话复制为一条可独立续采的新会话。
   复制当时的 `H`、`C`、存活样本、全部未删除片段及其编号、下一样本与片段编号，以及模式配置、
   自动机匹配进度、累计命中数、最近 100 次命中记录和命中留样启用状态（临时前缀随自动机状态
@@ -71,6 +79,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | POST | `/sessions/{sid}/fork` | 分叉出一条独立续采的新会话，返回含新 `session_id` 的会话状态（来源不存在返回 `404`） |
 | PUT | `/sessions/{sid}/limits` | 不停采样地调整 `history`(H) 与 `capacity`(C)，返回会话状态 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
+| POST | `/sessions/{sid}/samples/batch` | 成组写入一批整数样本（`values` 1～100 个）：整批接收或整批拒绝，`409` 响应含首个失败项从 1 起的 `index` |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
 | POST | `/sessions/{sid}/hit-fragments/enable` | 启用命中留样：每次模式命中自动生成 `completed` 留样片段（每会话一次） |
@@ -82,10 +91,12 @@ docker run --rm -p 8000:8000 sample-fragment-service
 错误码：`404` 会话/片段不存在；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
 查询未配置 pattern 的会话、调整参数与存活样本或片段冲突（新历史窗口含已回收样本、
 未删除片段总长或所需序号并集超过新 `C`）、命中留样启用条件不满足（未配置 pattern、已有样本、
-重复启用、模式长度超过 `C`）、启用命中留样后写入或调参超容（含新 `C` 容不下完整模式）；
+重复启用、模式长度超过 `C`）、启用命中留样后写入或调参超容（含新 `C` 容不下完整模式）、
+批量写入任一步超容（整批回滚，响应含首个失败项从 1 起的 `index`）；
 `400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；`422` 请求体不合法
 （含 pattern 长度非法、元素为布尔值或字符串，
-以及调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`）。
+调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`，
+以及批量 `values` 缺失/非数组、长度非 1～100 或元素为布尔值/字符串/浮点）。
 
 ## 调用示例
 
@@ -566,6 +577,109 @@ curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/8
 curl -s -X POST http://localhost:8000/sessions/8/fork
 # {"session_id":11,"history":2,"capacity":6,"next_seq":9,"used":5,
 #  "stored_seqs":[4,5,6,7,8],"fragments":[2]}
+```
+
+### 17. 成组写入：批内命中自动留样
+
+会话 12 以 `H=2, C=3` 创建，配置 pattern `[1,1]` 并启用命中留样，然后**一批**写入
+`[1, 1, 1]`。批内逐条应用匹配与留样规则：`seq=2` 命中 `(1,2)`、`seq=3` 重叠命中 `(2,3)`，
+各自动生成一个 `completed` 留样片段；每步都核算容量（第三步并集 `{1,2,3}` 恰好占满 `C=3`）：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# {"session_id":12,"history":2,"capacity":3}
+
+curl -s -X PUT http://localhost:8000/sessions/12/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 1]}'
+# {"pattern":[1,1]}
+
+curl -s -X POST http://localhost:8000/sessions/12/hit-fragments/enable
+# {"session_id":12,"hit_fragments_enabled":true,"pattern":[1,1]}
+
+curl -s -X POST http://localhost:8000/sessions/12/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [1, 1, 1]}'
+# [{"seq":1,"value":1},{"seq":2,"value":1},{"seq":3,"value":1}]
+
+curl -s http://localhost:8000/sessions/12/pattern/hits
+# {"pattern":[1,1],"hit_count":2,
+#  "recent_hits":[{"start_seq":1,"end_seq":2},{"start_seq":2,"end_seq":3}]}
+
+curl -s http://localhost:8000/sessions/12/fragments
+# [{"fragment_id":1,"center":2,"before":1,"after":0,"start":1,"end":2,"status":"completed"},
+#  {"fragment_id":2,"center":3,"before":1,"after":0,"start":2,"end":3,"status":"completed"}]
+```
+
+### 18. 批量超容整批回滚，释放容量后整批重试
+
+会话 13（`H=2, C=4`）批量写入 `[10, 20, 30]`，触发引用序号 2–5 的片段 1，再写入 `seq=4`：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# {"session_id":13,"history":2,"capacity":4}
+
+curl -s -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [10, 20, 30]}'
+# [{"seq":1,"value":10},{"seq":2,"value":20},{"seq":3,"value":30}]
+
+curl -s -X POST http://localhost:8000/sessions/13/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 2}'
+# {"fragment_id":1,"center":3,"before":1,"after":2,"start":2,"end":5,"status":"pending"}
+
+curl -s -X POST http://localhost:8000/sessions/13/samples \
+  -H 'Content-Type: application/json' -d '{"value": 40}'
+# {"seq":4,"value":40}
+```
+
+批量写入 `[50, 60, 70]`：第 1 项 `seq=5` 成功（片段 1 随之 `completed`，并集 `{2,3,4,5}`
+恰好占满 `C=4`），第 2 项 `seq=6` 需要 `{2,3,4,5,6}` 共 5 个位置、超出容量——**整批 `409`**，
+响应含首个失败项从 1 起的 `index`：
+
+```bash
+curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [50, 60, 70]}'
+# {"detail":"批量写入第 2 项（从 1 起）容量不足：整批已回滚，会话状态保持批前不变","index":2}
+# 409
+```
+
+状态完全保持批前：`seq=5` 未消耗、已写入的 `50` 不留痕、片段 1 回到 `pending`：
+
+```bash
+curl -s http://localhost:8000/sessions/13
+# {"session_id":13,"history":2,"capacity":4,"next_seq":5,"used":3,
+#  "stored_seqs":[2,3,4],"fragments":[1]}
+
+curl -s http://localhost:8000/sessions/13/fragments/1
+# {"fragment_id":1,"center":3,"before":1,"after":2,"start":2,"end":5,"status":"pending",
+#  "samples":[{"seq":2,"value":20},{"seq":3,"value":30},{"seq":4,"value":40}]}
+```
+
+删除片段 1 释放容量后**整批重试**，同一批值按序获得连续序号：
+
+```bash
+curl -s -X DELETE http://localhost:8000/sessions/13/fragments/1 -o /dev/null -w '%{http_code}\n'
+# 204   —— 解除引用并回收，序号 2 被回收
+
+curl -s -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [50, 60, 70]}'
+# [{"seq":5,"value":50},{"seq":6,"value":60},{"seq":7,"value":70}]
+```
+
+非法输入返回 `422` 且不改变任何状态；未知会话返回 `404`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [1, true, "x", 1.5]}'
+# 422   —— 布尔值、字符串、浮点数均拒绝
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/13/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": []}'
+# 422   —— 长度须为 1～100
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/99/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [1]}'
+# 404   —— 会话不存在
 ```
 
 ## 本地开发（可选）
